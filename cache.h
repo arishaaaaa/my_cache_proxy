@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "request.h"
 
@@ -18,21 +20,19 @@ typedef struct {
     int is_loading;
     int is_size_full;
     int is_error;
-    pthread_rwlock_t rwlock;
     pthread_mutex_t elem_mutex;
+    pthread_cond_t loading_cond;
 } CacheItem;
 
 typedef struct {
     CacheItem cache[MAX_CACHE_SIZE];
+    pthread_mutex_t cache_global_mutex;
 } Cache;
 
-void       init_cache(Cache* cache);
+void init_cache(Cache* cache);
+void destroy_cache(Cache* cache);
 
-CacheItem* find_url_in_cache(Cache* cache, const char* url);
-CacheItem* add_url_to_cache(Cache* cache, const char* url);
-int        find_empty_url_in_cache(Cache* cache);
-
-void       delete_item(const char* url, Cache* cache);
-void       destroy_cache(Cache* cache);
+void delete_item(const char* url, Cache* cache);
+CacheItem* atomic_find_or_add_url(Cache* cache, const char* url);
 
 #endif //CACHE_H
