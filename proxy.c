@@ -1,13 +1,7 @@
 #include "proxy.h"
 
-#include <pthread.h>
-#include <semaphore.h>
-
-typedef struct {
-    char* request;
-    Cache* cache;
-    int client_socket;
-} ThreadArgs;
+#include <sys/types.h>
+#include <netdb.h>
 
 int server_socket_init() {
     int server_socket = socket(AF_INET, SOCK_STREAM, 0); 
@@ -41,31 +35,23 @@ void binding_and_listening(int server_socket, struct sockaddr_in* server_addr) {
     printf("Proxy server started. Listening on port %d...\n", PORT);
 }
 
-void read_and_cache_rest(int dest_socket, CacheItem* item, size_t already_read) {
-    char buffer[BUFFER_SIZE] = {0};
-    size_t bytes_read, all_bytes_read = already_read;
-
-    while ((bytes_read = read(dest_socket, buffer, BUFFER_SIZE)) > 0) {
-        if (all_bytes_read + bytes_read > CACHE_BUFFER_SIZE) {
-            printf("Data size exceeds CACHE_BUFFER_SIZE! Not saving to cache. Closing connection...\n");
-
-            pthread_mutex_lock(&item->elem_mutex);
-            item->is_size_full = 1;
-            pthread_mutex_unlock(&item->elem_mutex);
-
-            break;
+int send_to(int socket, void* data, unsigned int size) {
+    ssize_t sent = 0;
+    ssize_t total_sent = 0;
+    char* buffer = (char*)data;
+    
+    while (total_sent < size) {
+        sent = write(socket, buffer + total_sent, size - total_sent);
+        if (sent <= 0) {
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            return -1;
         }
-
-        // Записываем часть ответа в кэш
-        pthread_rwlock_wrlock(&item->rwlock);
-
-        memcpy(item->data->memory + all_bytes_read, buffer, bytes_read);
-        item->data->size += bytes_read;
-
-        pthread_rwlock_unlock(&item->rwlock);
-
-        all_bytes_read += bytes_read;
+        total_sent += sent;
     }
+    
+    return total_sent;
 }
 
 void* fetch_and_cache_data(void* arg) {
@@ -73,12 +59,20 @@ void* fetch_and_cache_data(void* arg) {
     Cache* cache = args->cache;
     char* request = args->request;
     int client_socket = args->client_socket;
+    CacheItem* item = args->item;
     
     char* host = extract_host(request, 50);
     char* url = extract_url(request);
     
     if (!host || !url) {
         printf("Error: Could not extract host or URL\n");
+        
+        pthread_mutex_lock(&item->elem_mutex);
+        item->is_error = 1;
+        item->is_loading = 0;
+        pthread_cond_broadcast(&item->loading_cond);
+        pthread_mutex_unlock(&item->elem_mutex);
+        
         free(host);
         free(url);
         free(request);
@@ -87,19 +81,8 @@ void* fetch_and_cache_data(void* arg) {
         return NULL;
     }
 
-    CacheItem* item = add_url_to_cache(cache, url);
-    if (!item) {
-        printf("Error: Could not add item to cache\n");
-        free(host);
-        free(url);
-        free(request);
-        free(args);
-        close(client_socket);
-        return NULL;
-    }
-    
+    // Инициализируем память для данных
     pthread_mutex_lock(&item->elem_mutex);
-    item->is_loading = 1;
     item->data->memory = (char*)calloc(CACHE_BUFFER_SIZE, sizeof(char));
     item->data->size = 0;
     pthread_mutex_unlock(&item->elem_mutex);
@@ -111,8 +94,12 @@ void* fetch_and_cache_data(void* arg) {
         
         pthread_mutex_lock(&item->elem_mutex);
         item->is_error = 1;
-        free(item->data->memory);
-        item->data->memory = NULL;
+        item->is_loading = 0;
+        if (item->data->memory != NULL) {
+            free(item->data->memory);
+            item->data->memory = NULL;
+        }
+        pthread_cond_broadcast(&item->loading_cond);
         pthread_mutex_unlock(&item->elem_mutex);
         
         free(host);
@@ -132,8 +119,12 @@ void* fetch_and_cache_data(void* arg) {
         
         pthread_mutex_lock(&item->elem_mutex);
         item->is_error = 1;
-        free(item->data->memory);
-        item->data->memory = NULL;
+        item->is_loading = 0;
+        if (item->data->memory != NULL) {
+            free(item->data->memory);
+            item->data->memory = NULL;
+        }
+        pthread_cond_broadcast(&item->loading_cond);
         pthread_mutex_unlock(&item->elem_mutex);
         
         free(host);
@@ -150,6 +141,7 @@ void* fetch_and_cache_data(void* arg) {
     char buffer[BUFFER_SIZE] = {0};
     ssize_t bytes_read, all_bytes_read = 0;
     int client_disconnected = 0;
+    int first_chunk = 1;
 
     while ((bytes_read = read(dest_socket, buffer, BUFFER_SIZE)) > 0) {
         // Проверяем, не отключился ли клиент
@@ -167,6 +159,27 @@ void* fetch_and_cache_data(void* arg) {
             }
         }
 
+        // Проверяем статус ответа в первом чанке
+        if (first_chunk) {
+            if (!is_response_status_ok(buffer)) {
+                printf("Server returned error, not saving to cache.\n");
+                
+                pthread_mutex_lock(&item->elem_mutex);
+                item->is_error = 1;
+                item->is_loading = 0;
+                if (item->data->memory != NULL) {
+                    free(item->data->memory);
+                    item->data->memory = NULL;
+                }
+                pthread_cond_broadcast(&item->loading_cond);
+                pthread_mutex_unlock(&item->elem_mutex);
+                
+                break;
+            }
+            first_chunk = 0;
+        }
+
+        // Проверяем размер данных
         if (all_bytes_read + bytes_read > CACHE_BUFFER_SIZE) {
             printf("Data size exceeds CACHE_BUFFER_SIZE! Not saving to cache.\n");
             
@@ -177,35 +190,34 @@ void* fetch_and_cache_data(void* arg) {
             break;
         }
 
-        pthread_rwlock_wrlock(&item->rwlock);
-        memcpy(item->data->memory + all_bytes_read, buffer, bytes_read);
-        item->data->size += bytes_read;
-        pthread_rwlock_unlock(&item->rwlock);
+        // Сохраняем данные в кеш
+        pthread_mutex_lock(&item->elem_mutex);
+        if (item->data->memory != NULL) {
+            memcpy(item->data->memory + all_bytes_read, buffer, bytes_read);
+            item->data->size += bytes_read;
+        }
+        pthread_mutex_unlock(&item->elem_mutex);
 
         all_bytes_read += bytes_read;
-        
-        if (all_bytes_read == bytes_read && !is_response_status_ok(buffer)) {
-            printf("Server returned error, not saving to cache.\n");
-            
-            pthread_mutex_lock(&item->elem_mutex);
-            item->is_error = 1;
-            pthread_mutex_unlock(&item->elem_mutex);
-            
-            break;
-        }
     }
 
+    // Завершаем загрузку
     pthread_mutex_lock(&item->elem_mutex);
     item->is_loading = 0;
     
     if (item->is_size_full || item->is_error) {
         printf("Error appeared while reading the response, freeing memory...\n");
-        free(item->data->memory);
-        item->data->memory = NULL;
-        item->data->size = 0;
+        if (item->data->memory != NULL) {
+            free(item->data->memory);
+            item->data->memory = NULL;
+            item->data->size = 0;
+        }
     } else {
         printf("Data added to cache with size %zu\n\n", item->data->size);
     }
+    
+    // Будим все потоки, ожидающие завершения загрузки
+    pthread_cond_broadcast(&item->loading_cond);
     pthread_mutex_unlock(&item->elem_mutex);
 
     if (!client_disconnected) {
@@ -220,15 +232,10 @@ void* fetch_and_cache_data(void* arg) {
     return NULL;
 }
 
-int send_to(int socket, void* data, unsigned int size) {
-    return write(socket, data, size);
-}
-
 void handle_client_request(void* args) {
     struct FuncArgs* arg = (struct FuncArgs*)args;
     int client_socket = arg->client_socket;
     Cache* cache = arg->cache;
-    
     
     free(args);
 
@@ -242,8 +249,8 @@ void handle_client_request(void* args) {
         } else {
             perror("Error reading from socket");
         }
-        close(client_socket);
         free(buffer);
+        close(client_socket);
         return;
     }
 
@@ -255,87 +262,97 @@ void handle_client_request(void* args) {
         return;
     }
 
-    CacheItem* item = find_url_in_cache(cache, url);
-    if (item != NULL) {
-        printf("Data found in cache!\n");
+    printf("Request URL: %s\n", url);
 
-        pthread_mutex_lock(&item->elem_mutex);
-        if (item->is_loading) {
-            pthread_mutex_unlock(&item->elem_mutex);
-            printf("Data is loading by other client right now. Starting to catch...\n");
-
-            size_t sent = 0;
-            int attempts = 0;
-            const int max_attempts = 100; // Максимальное количество попыток (10 секунд)
-
-            while (attempts < max_attempts) {
-                pthread_rwlock_rdlock(&item->rwlock);
-                size_t to_send = item->data->size - sent;
-                
-                if (to_send > 0) {
-                    ssize_t written = send_to(client_socket, item->data->memory + sent, to_send);
-                    if (written <= 0) {
-                        pthread_rwlock_unlock(&item->rwlock);
-                        if (errno == EPIPE || errno == ECONNRESET) {
-                            printf("Client disconnected during streaming\n");
-                        } else {
-                            printf("Error while sending data to client: %s\n", strerror(errno));
-                        }
-                        break;
-                    }
-                    sent += written;
-                }
-                
-                pthread_rwlock_unlock(&item->rwlock);
-
-                pthread_mutex_lock(&item->elem_mutex);
-                if (!item->is_loading && sent == item->data->size) {
-                    pthread_mutex_unlock(&item->elem_mutex);
-                    printf("Finished streaming cached data\n");
-                    break;
-                }
-                pthread_mutex_unlock(&item->elem_mutex);
-
-                usleep(100000); 
-                attempts++;
-            }
-            
-            if (attempts >= max_attempts) {
-                printf("Timeout waiting for data to load\n");
-            }
-        } else {
-            // Данные уже загружены, отправляем все сразу
-            if (item->data->size > 0) {
-                send_to(client_socket, item->data->memory, item->data->size);
-            }
-            pthread_mutex_unlock(&item->elem_mutex);
+    // Атомарно находим или добавляем URL в кеш
+    CacheItem* item = atomic_find_or_add_url(cache, url);
+    
+    pthread_mutex_lock(&item->elem_mutex);
+    
+    if (item->is_loading) {
+        // Данные загружаются другим потоком, ждем
+        printf("Data is loading by other client. Waiting...\n");
+        
+        while (item->is_loading) {
+            pthread_cond_wait(&item->loading_cond, &item->elem_mutex);
         }
+        
+        // Проверяем результат загрузки
+        if (item->is_error || item->data->memory == NULL) {
+            printf("Error occurred while loading data\n");
+            pthread_mutex_unlock(&item->elem_mutex);
+            free(buffer);
+            free(url);
+            close(client_socket);
+            return;
+        }
+        
+        printf("Sending cached data to client\n");
+        if (item->data->size > 0) {
+            send_to(client_socket, item->data->memory, item->data->size);
+        }
+        
+    } else if (item->data->memory != NULL && item->data->size > 0) {
+        // Данные уже загружены в кеш
+        printf("Sending existing cached data to client\n");
+        send_to(client_socket, item->data->memory, item->data->size);
+        
     } else {
+        // Нужно начать загрузку
         printf("Data not found in cache. Fetching from remote server...\n");
-
+        
+        // Помечаем как загружаемое
+        item->is_loading = 1;
+        pthread_mutex_unlock(&item->elem_mutex);
+        
+        // Запускаем поток загрузки
         pthread_t tid;
         ThreadArgs* thread_args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
         thread_args->cache = cache;
-        thread_args->request = strdup(buffer); // Копир запрос
+        thread_args->request = strdup(buffer);
         thread_args->client_socket = client_socket;
-
+        thread_args->item = item;
+        
         printf("Initializing new downloading thread\n");
-
+        
         int err = pthread_create(&tid, NULL, &fetch_and_cache_data, thread_args);
         if (err != 0) {
             fprintf(stderr, "Error creating thread: %s\n", strerror(err));
+            
+            pthread_mutex_lock(&item->elem_mutex);
+            item->is_loading = 0;
+            item->is_error = 1;
+            pthread_cond_broadcast(&item->loading_cond);
+            pthread_mutex_unlock(&item->elem_mutex);
+            
             free(thread_args->request);
             free(thread_args);
-        } else {
-            pthread_detach(tid);
+            free(buffer);
+            free(url);
+            close(client_socket);
+            return;
+        }
+        
+        pthread_detach(tid);
+        
+        // Ждем завершения загрузки
+        pthread_mutex_lock(&item->elem_mutex);
+        while (item->is_loading) {
+            pthread_cond_wait(&item->loading_cond, &item->elem_mutex);
+        }
+        
+        // Отправляем загруженные данные
+        if (!item->is_error && item->data->memory != NULL && item->data->size > 0) {
+            printf("Sending freshly loaded data to client\n");
+            send_to(client_socket, item->data->memory, item->data->size);
         }
     }
-
-    // Не закрываем client_socket здесь - он будет закрыт в fetch_and_cache_data
-    // ну или уже закрыт при ошибке отправки
+    
+    pthread_mutex_unlock(&item->elem_mutex);
     
     free(buffer);
     free(url);
+    close(client_socket);
 }
 
 // Извлекаем URL из HTTP-запроса
@@ -345,7 +362,7 @@ char* extract_url(char* request) {
         return NULL;
     }
 
-    //конец URL
+    // Конец URL
     const char* url_end = strstr(method_end + 1, " ");
     if (!url_end) {
         return NULL;
@@ -392,5 +409,7 @@ char* extract_host(const char* request, size_t max_host_len) {
 }
 
 int is_response_status_ok(char* buffer) {
-    return strstr(buffer, "HTTP/1.0 200 OK") || strstr(buffer, "HTTP/1.1 200 OK");
+    return strstr(buffer, "HTTP/1.0 200 OK") != NULL || 
+           strstr(buffer, "HTTP/1.1 200 OK") != NULL ||
+           strstr(buffer, "HTTP/1.1 200") != NULL;
 }
